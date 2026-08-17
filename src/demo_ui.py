@@ -33,6 +33,7 @@ if str(_ROOT) not in sys.path:
 import streamlit as st
 
 from src.config import settings
+from src.evaluate import find_session, find_user
 from src.llm import gemini_available, generate_reply
 from src.memory_student import StudentMemory
 from src.short_term import ShortTermMemory
@@ -107,8 +108,47 @@ def retrieve_for_case(
       * Keep user_id and thread_id from the loaded case.
       * Finish with memory.assemble_context(layers).
     """
-    _ = (memory, case, extra_messages, settings, ShortTermMemory)
-    raise NotImplementedError("BONUS TODO: run student retrieval for the loaded case")
+    dataset = load_dataset()
+    user_id = case["user_id"]
+    thread_id = case["thread_id"]
+    query = case["query"]
+
+    # --- short-term: fixture (or matching session) + whatever was typed in chat ---
+    stm = ShortTermMemory(strategy="sliding", max_recent_messages=6, pressure_tokens=450)
+    fixture = case.get("fixture_messages")
+    if not fixture:
+        user = find_user(dataset, user_id)
+        session = find_session(user, thread_id)
+        fixture = (session or {}).get("messages", [])
+    for msg in fixture or []:
+        stm.add(msg["role"], msg["content"])
+    for msg in extra_messages or []:
+        stm.add(msg["role"], msg["content"])
+
+    # --- decide which durable layers this case needs ---
+    layer = case.get("expected_layer", "short_term")
+    if layer == "mixed":
+        wanted = case.get("retrieve_layers") or ["long_term", "semantic"]
+    elif layer == "short_term":
+        wanted = []
+    else:
+        wanted = [layer]
+
+    layers: dict[str, str] = {
+        "short_term": stm.render(),
+        "long_term": "",
+        "episodic": "",
+        "semantic": "",
+    }
+    if "long_term" in wanted:
+        layers["long_term"] = memory.retrieve_long_term(user_id=user_id, thread_id=thread_id, query=query)
+    if "episodic" in wanted:
+        layers["episodic"] = memory.retrieve_episodic(user_id, query)
+    if "semantic" in wanted:
+        layers["semantic"] = memory.retrieve_semantic(settings.semantic_graph_id, query)
+
+    merged_context, budget = memory.assemble_context(layers)
+    return {"merged_context": merged_context, "layers": layers, "budget": budget}
 
 
 def main() -> None:
