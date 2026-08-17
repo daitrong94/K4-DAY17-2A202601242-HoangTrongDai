@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
 from typing import Any
 
 from .config import settings
@@ -70,14 +72,58 @@ class StudentMemory:
                 graph_id=graph_id,
                 query=q,
                 scope="episodes",
-                limit=8,
+                limit=12,
             )
         except Exception:
             results = self.client.graph.search(
                 graph_id=graph_id,
                 query=q,
                 scope="nodes",
-                limit=8,
+                limit=12,
+            )
+        # Each KB doc is ingested twice (verbose JSON blob + compact summary
+        # text, see add_semantic_documents). For mixed queries that touch two
+        # different KB docs, the verbose duplicate can eat the whole semantic
+        # token budget and push a later, still-relevant doc's marker past the
+        # trim cutoff. Dedupe by doc id, keeping the shorter (text) representation
+        # so more distinct markers survive the 3% budget. The compact text
+        # episode isn't valid JSON itself, so first map summary text -> id from
+        # the JSON episodes, then match text episodes against that map.
+        episodes = getattr(results, "episodes", None) or []
+        if episodes:
+            id_by_summary: dict[str, str] = {}
+            for ep in episodes:
+                content = getattr(ep, "content", "") or ""
+                try:
+                    parsed = json.loads(content)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(parsed, dict) and parsed.get("id") and parsed.get("summary"):
+                    id_by_summary[parsed["summary"]] = parsed["id"]
+
+            best_by_id: dict[str, Any] = {}
+            for ep in episodes:
+                content = getattr(ep, "content", "") or ""
+                doc_id = content
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and parsed.get("id"):
+                        doc_id = parsed["id"]
+                except (ValueError, TypeError):
+                    if content in id_by_summary:
+                        doc_id = id_by_summary[content]
+                current = best_by_id.get(doc_id)
+                if current is None or len(content) < len(getattr(current, "content", "") or ""):
+                    best_by_id[doc_id] = ep
+            # results is a frozen pydantic model (can't reassign .episodes in
+            # place), so pass a plain namespace copy with the deduped list.
+            results = SimpleNamespace(
+                context=getattr(results, "context", None),
+                edges=getattr(results, "edges", None),
+                episodes=list(best_by_id.values()),
+                nodes=getattr(results, "nodes", None),
+                observations=getattr(results, "observations", None),
+                thread_summaries=getattr(results, "thread_summaries", None),
             )
         return render_graph_search(results)
 
